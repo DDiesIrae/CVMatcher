@@ -1,0 +1,193 @@
+import json, os, re, sys, traceback
+from pathlib import Path
+from typing import Literal
+from pydantic import BaseModel, Field
+from PySide6.QtCore import Qt, QThread, Signal
+from PySide6.QtGui import QColor
+from PySide6.QtWidgets import (QApplication,QMainWindow,QWidget,QVBoxLayout,QHBoxLayout,QLabel,
+ QPlainTextEdit,QPushButton,QFileDialog,QListWidget,QListWidgetItem,QTabWidget,QTableWidget,
+ QTableWidgetItem,QHeaderView,QMessageBox,QProgressBar,QDialog,QFormLayout,QLineEdit,QComboBox,
+ QDialogButtonBox,QSplitter,QAbstractItemView)
+from pypdf import PdfReader
+from docx import Document
+from openpyxl import Workbook
+from openpyxl.styles import Font, PatternFill, Alignment
+import keyring
+
+APP='CV Matcher'; SERVICE='cv-matcher-openai'
+
+class Requirement(BaseModel):
+    id: str
+    requirement: str
+    priority: Literal['must_have','nice_to_have']
+    weight: int = Field(ge=1, le=100)
+
+class VacancyProfile(BaseModel):
+    position: str
+    requirements: list[Requirement]
+
+class MatchItem(BaseModel):
+    requirement_id: str
+    status: Literal['MATCH','PARTIAL_MATCH','NO_MATCH','NOT_FOUND']
+    evidence: str
+    explanation: str
+
+class CandidateAssessment(BaseModel):
+    candidate_name: str
+    matches: list[MatchItem]
+    summary: str
+
+STATUS_FACTOR={'MATCH':1.0,'PARTIAL_MATCH':0.5,'NO_MATCH':0.0,'NOT_FOUND':0.0}
+STATUS_ICON={'MATCH':'✓','PARTIAL_MATCH':'~','NO_MATCH':'✗','NOT_FOUND':'?'}
+
+
+def extract_text(path: str) -> str:
+    p=Path(path); ext=p.suffix.lower()
+    if ext=='.pdf':
+        return '\n'.join((page.extract_text() or '') for page in PdfReader(path).pages)
+    if ext=='.docx':
+        return '\n'.join(x.text for x in Document(path).paragraphs)
+    if ext in ('.txt','.md'):
+        return p.read_text(encoding='utf-8', errors='ignore')
+    raise ValueError(f'Неподдерживаемый формат: {ext}')
+
+
+def calc_score(profile, assessment):
+    reqs={r.id:r for r in profile.requirements}; found={m.requirement_id:m for m in assessment.matches}
+    total=sum(r.weight for r in profile.requirements) or 1
+    earned=sum(r.weight*STATUS_FACTOR.get(found.get(r.id).status if found.get(r.id) else 'NOT_FOUND',0) for r in profile.requirements)
+    must=[r for r in profile.requirements if r.priority=='must_have']
+    must_ok=sum(1 for r in must if found.get(r.id) and found[r.id].status=='MATCH')
+    nice=[r for r in profile.requirements if r.priority=='nice_to_have']
+    nice_ok=sum(1 for r in nice if found.get(r.id) and found[r.id].status=='MATCH')
+    return round(100*earned/total), must_ok, len(must), nice_ok, len(nice)
+
+class DropList(QListWidget):
+    pathsChanged=Signal()
+    def __init__(self):
+        super().__init__(); self.setAcceptDrops(True); self.setSelectionMode(QAbstractItemView.ExtendedSelection)
+        self.setMinimumHeight(150); self.setToolTip('Перетащите сюда PDF, DOCX или TXT')
+    def dragEnterEvent(self,e):
+        if e.mimeData().hasUrls(): e.acceptProposedAction()
+    def dragMoveEvent(self,e): e.acceptProposedAction()
+    def dropEvent(self,e):
+        self.add_paths([u.toLocalFile() for u in e.mimeData().urls() if u.isLocalFile()]); e.acceptProposedAction()
+    def add_paths(self, paths):
+        existing={self.item(i).data(Qt.UserRole) for i in range(self.count())}
+        for path in paths:
+            if Path(path).suffix.lower() in {'.pdf','.docx','.txt','.md'} and path not in existing:
+                it=QListWidgetItem(Path(path).name); it.setData(Qt.UserRole,path); it.setToolTip(path); self.addItem(it); existing.add(path)
+        self.pathsChanged.emit()
+    def paths(self): return [self.item(i).data(Qt.UserRole) for i in range(self.count())]
+
+class SettingsDialog(QDialog):
+    def __init__(self,parent=None):
+        super().__init__(parent); self.setWindowTitle('Настройки'); f=QFormLayout(self)
+        self.key=QLineEdit(); self.key.setEchoMode(QLineEdit.Password); self.key.setText(keyring.get_password(SERVICE,'api_key') or '')
+        self.model=QComboBox(); self.model.addItems(['gpt-5.6-luna','gpt-5.6-terra','gpt-5.6-sol'])
+        self.model.setCurrentText(keyring.get_password(SERVICE,'model') or 'gpt-5.6-luna')
+        f.addRow('OpenAI API key:',self.key); f.addRow('Модель:',self.model)
+        b=QDialogButtonBox(QDialogButtonBox.Save|QDialogButtonBox.Cancel); b.accepted.connect(self.save); b.rejected.connect(self.reject); f.addRow(b)
+    def save(self):
+        keyring.set_password(SERVICE,'api_key',self.key.text().strip()); keyring.set_password(SERVICE,'model',self.model.currentText()); self.accept()
+
+class AnalyzeThread(QThread):
+    progress=Signal(int,str); done=Signal(object,object); failed=Signal(str)
+    def __init__(self,vacancy,paths): super().__init__(); self.vacancy=vacancy; self.paths=paths
+    def run(self):
+        try:
+            from openai import OpenAI
+            key=keyring.get_password(SERVICE,'api_key') or os.getenv('OPENAI_API_KEY')
+            if not key: raise RuntimeError('Добавьте OpenAI API key в Настройки.')
+            model=keyring.get_password(SERVICE,'model') or 'gpt-5.6-luna'; client=OpenAI(api_key=key)
+            self.progress.emit(3,'Извлекаю требования вакансии…')
+            resp=client.responses.parse(model=model,input=[
+              {'role':'system','content':('Извлеки только профессиональные требования вакансии. Не используй имя, возраст, пол, фото, национальность, семейное положение и другие нерелевантные персональные признаки. '
+                 'Каждому требованию дай короткий уникальный id, priority must_have/nice_to_have и вес 1-100 по важности. Не выдумывай требования.')},
+              {'role':'user','content':self.vacancy}], text_format=VacancyProfile)
+            profile=resp.output_parsed
+            results=[]
+            for i,path in enumerate(self.paths):
+                self.progress.emit(8+int(85*i/max(1,len(self.paths))),f'Анализ: {Path(path).name}')
+                text=extract_text(path)
+                if not text.strip(): raise RuntimeError(f'Не удалось извлечь текст из {Path(path).name}. Возможно, это скан без текстового слоя.')
+                req_json=json.dumps(profile.model_dump(),ensure_ascii=False)
+                prompt=f'''Сравни резюме с требованиями. Для КАЖДОГО requirement_id верни ровно один match.\nСтатусы: MATCH = явно подтверждено; PARTIAL_MATCH = подтверждено частично; NO_MATCH = в CV есть данные, явно противоречащие требованию; NOT_FOUND = данных недостаточно.\nEvidence — короткая цитата/факт только из CV, без выдумок. Не делай выводов по защищенным/нерелевантным персональным признакам. Оценивай только профессиональные данные.\nТРЕБОВАНИЯ:\n{req_json}\n\nРЕЗЮМЕ ({Path(path).name}):\n{text[:90000]}'''
+                rr=client.responses.parse(model=model,input=[{'role':'system','content':'Ты аккуратный инструмент сопоставления CV с требованиями. Не принимай решение о найме; только документируй соответствие требованиям.'},{'role':'user','content':prompt}],text_format=CandidateAssessment)
+                results.append((path,rr.output_parsed))
+            self.progress.emit(100,'Готово'); self.done.emit(profile,results)
+        except Exception as e: self.failed.emit(f'{e}\n\n{traceback.format_exc()}')
+
+class MainWindow(QMainWindow):
+    def __init__(self):
+        super().__init__(); self.setWindowTitle('CV Matcher'); self.resize(1150,760); self.profile=None; self.results=[]
+        root=QWidget(); self.setCentralWidget(root); lay=QVBoxLayout(root)
+        top=QHBoxLayout(); title=QLabel('CV MATCHER'); title.setStyleSheet('font-size:24px;font-weight:700'); top.addWidget(title); top.addStretch()
+        settings=QPushButton('⚙ Настройки'); settings.clicked.connect(lambda: SettingsDialog(self).exec()); top.addWidget(settings); lay.addLayout(top)
+        self.tabs=QTabWidget(); lay.addWidget(self.tabs)
+        inp=QWidget(); il=QVBoxLayout(inp); il.addWidget(QLabel('<b>Вакансия</b>'))
+        self.vac=QPlainTextEdit(); self.vac.setPlaceholderText('Вставьте сюда описание вакансии…'); il.addWidget(self.vac)
+        vh=QHBoxLayout(); vf=QPushButton('Загрузить вакансию из файла'); vf.clicked.connect(self.load_vac); vh.addWidget(vf); vh.addStretch(); il.addLayout(vh)
+        il.addWidget(QLabel('<b>Резюме — перетащите файлы в область ниже (Drag & Drop)</b>'))
+        self.drop=DropList(); il.addWidget(self.drop)
+        bh=QHBoxLayout(); add=QPushButton('+ Добавить резюме'); add.clicked.connect(self.add_cv); rm=QPushButton('Удалить выбранные'); rm.clicked.connect(self.remove_cv); bh.addWidget(add); bh.addWidget(rm); bh.addStretch(); il.addLayout(bh)
+        self.go=QPushButton('▶ ПРОАНАЛИЗИРОВАТЬ'); self.go.setMinimumHeight(46); self.go.clicked.connect(self.analyze); il.addWidget(self.go)
+        self.progress=QProgressBar(); self.progress.setVisible(False); il.addWidget(self.progress); self.status=QLabel(''); il.addWidget(self.status)
+        self.tabs.addTab(inp,'Анализ')
+        out=QWidget(); ol=QVBoxLayout(out); self.table=QTableWidget(0,6); self.table.setHorizontalHeaderLabels(['Кандидат','Score','Must have','Nice to have','Файл','Результат']); self.table.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch); self.table.doubleClicked.connect(self.show_detail); ol.addWidget(self.table)
+        ex=QPushButton('Экспортировать в Excel'); ex.clicked.connect(self.export_excel); ol.addWidget(ex); self.tabs.addTab(out,'Результаты')
+    def load_vac(self):
+        p,_=QFileDialog.getOpenFileName(self,'Вакансия','','Documents (*.pdf *.docx *.txt *.md)')
+        if p:
+            try:self.vac.setPlainText(extract_text(p))
+            except Exception as e: QMessageBox.critical(self,'Ошибка',str(e))
+    def add_cv(self):
+        ps,_=QFileDialog.getOpenFileNames(self,'Резюме','','Documents (*.pdf *.docx *.txt *.md)'); self.drop.add_paths(ps)
+    def remove_cv(self):
+        for x in self.drop.selectedItems(): self.drop.takeItem(self.drop.row(x))
+    def analyze(self):
+        if not self.vac.toPlainText().strip() or not self.drop.paths(): QMessageBox.warning(self,'Нужны данные','Добавьте вакансию и хотя бы одно резюме.'); return
+        self.go.setEnabled(False); self.progress.setVisible(True); self.progress.setValue(0); self.worker=AnalyzeThread(self.vac.toPlainText(),self.drop.paths()); self.worker.progress.connect(self.on_progress); self.worker.done.connect(self.on_done); self.worker.failed.connect(self.on_fail); self.worker.start()
+    def on_progress(self,n,s): self.progress.setValue(n); self.status.setText(s)
+    def on_fail(self,s): self.go.setEnabled(True); self.progress.setVisible(False); QMessageBox.critical(self,'Ошибка анализа',s)
+    def on_done(self,profile,results):
+        self.go.setEnabled(True); self.profile=profile; self.results=results; self.table.setRowCount(0)
+        ranked=sorted(results,key=lambda x:calc_score(profile,x[1])[0],reverse=True); self.results=ranked
+        for path,a in ranked:
+            score,mo,mt,no,nt=calc_score(profile,a); row=self.table.rowCount(); self.table.insertRow(row)
+            verdict='Высокое соответствие' if score>=80 else ('Среднее' if score>=60 else 'Низкое')
+            vals=[a.candidate_name or Path(path).stem,f'{score}%',f'{mo}/{mt}',f'{no}/{nt}',Path(path).name,verdict]
+            for c,v in enumerate(vals): self.table.setItem(row,c,QTableWidgetItem(str(v)))
+        self.tabs.setCurrentIndex(1); self.progress.setVisible(False); self.status.setText(f'Обработано резюме: {len(results)}')
+    def show_detail(self,index):
+        if not self.profile or index.row()>=len(self.results): return
+        path,a=self.results[index.row()]; reqs={r.id:r for r in self.profile.requirements}; d=QDialog(self); d.setWindowTitle(a.candidate_name); d.resize(950,650); l=QVBoxLayout(d)
+        score,*_=calc_score(self.profile,a); l.addWidget(QLabel(f'<h2>{a.candidate_name} — {score}%</h2><p>{a.summary}</p>'))
+        t=QTableWidget(len(a.matches),5); t.setHorizontalHeaderLabels(['Требование','Приоритет','Статус','Evidence','Комментарий']); t.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
+        for r,m in enumerate(a.matches):
+            q=reqs.get(m.requirement_id); vals=[q.requirement if q else m.requirement_id,q.priority if q else '',STATUS_ICON[m.status]+' '+m.status,m.evidence,m.explanation]
+            for c,v in enumerate(vals): t.setItem(r,c,QTableWidgetItem(v))
+        l.addWidget(t); d.exec()
+    def export_excel(self):
+        if not self.profile or not self.results: QMessageBox.information(self,'Нет данных','Сначала выполните анализ.'); return
+        p,_=QFileDialog.getSaveFileName(self,'Сохранить Excel','cv_match_results.xlsx','Excel (*.xlsx)')
+        if not p:return
+        wb=Workbook(); ws=wb.active; ws.title='Сводка'; headers=['Кандидат','Score','Must have','Nice to have','Файл']; ws.append(headers)
+        for path,a in self.results:
+            s,mo,mt,no,nt=calc_score(self.profile,a); ws.append([a.candidate_name,s/100,f'{mo}/{mt}',f'{no}/{nt}',Path(path).name]); ws.cell(ws.max_row,2).number_format='0%'
+        for cell in ws[1]: cell.font=Font(bold=True)
+        for col in ws.columns: ws.column_dimensions[col[0].column_letter].width=max(14,min(45,max(len(str(x.value or'')) for x in col)+2))
+        for path,a in self.results:
+            name=re.sub(r'[\\/*?:\[\]]','_',a.candidate_name)[:28] or 'Candidate'; base=name; k=2
+            while name in wb.sheetnames: name=f'{base[:25]}_{k}'; k+=1
+            sh=wb.create_sheet(name); sh.append(['Требование','Приоритет','Статус','Evidence','Комментарий']); matches={m.requirement_id:m for m in a.matches}
+            for q in self.profile.requirements:
+                m=matches.get(q.id); sh.append([q.requirement,q.priority,m.status if m else 'NOT_FOUND',m.evidence if m else '',m.explanation if m else ''])
+            for cell in sh[1]: cell.font=Font(bold=True)
+            sh.freeze_panes='A2'; sh.auto_filter.ref=sh.dimensions
+            for col in sh.columns: sh.column_dimensions[col[0].column_letter].width=max(14,min(60,max(len(str(x.value or'')) for x in col)+2))
+        wb.save(p); QMessageBox.information(self,'Готово',f'Excel сохранён:\n{p}')
+
+def main():
+    app=QApplication(sys.argv); app.setStyle('Fusion'); w=MainWindow(); w.show(); sys.exit(app.exec())
+if __name__=='__main__': main()
