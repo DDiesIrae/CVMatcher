@@ -14,7 +14,7 @@ from openpyxl import Workbook
 from openpyxl.styles import Font, PatternFill, Alignment
 import keyring
 
-APP='CV Matcher'; VERSION='0.3'; SERVICE='cv-matcher-ai'
+APP='CV Matcher'; VERSION='0.4'; SERVICE='cv-matcher-ai'
 
 class Requirement(BaseModel):
     id: str
@@ -67,6 +67,44 @@ def extract_text(path: str) -> str:
     raise ValueError(f'Неподдерживаемый формат: {ext}')
 
 
+DEMO_SKILLS = ['Python','Java','JavaScript','TypeScript','C#','C++','Go','PHP','Ruby','Kotlin','Swift','React','Angular','Vue','Node.js','Django','FastAPI','Flask','Spring','Spring Boot','.NET','SQL','PostgreSQL','MySQL','MongoDB','Redis','Kafka','RabbitMQ','Docker','Kubernetes','AWS','Azure','GCP','Git','Linux','REST','GraphQL','Terraform','Ansible','Jenkins','GitLab CI','CI/CD','Spark','Hadoop','Power BI','Tableau','Excel','1C','SAP','Salesforce','English']
+
+def _contains_term(text, term):
+    low=' '+text.lower()+' '
+    aliases={'Go':[' golang ',' go '],'C#':['c#','c sharp'],'C++':['c++'],'.NET':['.net','dotnet'],'Node.js':['node.js','nodejs'],'Spring Boot':['spring boot'],'PostgreSQL':['postgresql','postgres'],'Kubernetes':['kubernetes','k8s'],'AWS':['aws','amazon web services'],'GCP':['gcp','google cloud'],'CI/CD':['ci/cd','continuous integration'],'English':['english','английск'],'REST':['rest api',' rest ','restful']}
+    return any(x in low for x in aliases.get(term,[term.lower()]))
+
+def demo_profile(vacancy):
+    reqs=[]; seen=set(); idx=1
+    for skill in DEMO_SKILLS:
+        if skill in seen or not _contains_term(vacancy,skill): continue
+        seen.add(skill); low=vacancy.lower(); pos=low.find(skill.lower()); context=low[max(0,pos-90):pos+120] if pos>=0 else low
+        nice=any(x in context for x in ['желательно','будет плюсом','плюсом','nice to have','preferred','advantage'])
+        reqs.append(Requirement(id=f'r{idx}',requirement=skill,priority='nice_to_have' if nice else 'must_have',weight=5 if nice else 10)); idx+=1
+    m=re.search(r'(?:от\s*)?(\d+)\s*(?:\+\s*)?(?:лет|года|год|years?|yrs?)',vacancy,re.I)
+    if m: reqs.insert(0,Requirement(id='exp',requirement=f'Опыт работы от {m.group(1)} лет',priority='must_have',weight=15))
+    if not reqs:
+        for ch in [x.strip(' •-\t') for x in re.split(r'[\n;•]+',vacancy) if len(x.strip())>=8][:8]:
+            reqs.append(Requirement(id=f'r{idx}',requirement=ch[:120],priority='must_have',weight=10)); idx+=1
+    return VacancyProfile(position='Демо-позиция',requirements=reqs[:20])
+
+def demo_assessment(profile, cv_text, filename):
+    matches=[]
+    for q in profile.requirements:
+        if q.id=='exp':
+            need=int(re.search(r'(\d+)',q.requirement).group(1)); years=[int(x) for x in re.findall(r'(\d+)\s*(?:\+\s*)?(?:лет|года|год|years?|yrs?)',cv_text,re.I)]
+            if years and max(years)>=need: status='MATCH'; ev=f'Указан опыт {max(years)} лет'
+            elif years: status='PARTIAL_MATCH'; ev=f'Указан опыт {max(years)} лет'
+            else: status='NOT_FOUND'; ev='Срок опыта явно не найден'
+        elif _contains_term(cv_text,q.requirement):
+            status='MATCH'; ev=next((x.strip() for x in cv_text.splitlines() if _contains_term(x,q.requirement)),q.requirement)[:220]
+        else: status='NOT_FOUND'; ev='Упоминание не найдено в резюме'
+        matches.append(MatchItem(requirement_id=q.id,status=status,evidence=ev,explanation='Локальная демо-проверка по текстовым совпадениям; AI не использовался.'))
+    lines=[x.strip() for x in cv_text.splitlines() if x.strip()]; name=Path(filename).stem
+    if lines and len(lines[0])<80 and not any(c.isdigit() for c in lines[0]): name=lines[0]
+    ok=sum(m.status=='MATCH' for m in matches)
+    return CandidateAssessment(candidate_name=name,matches=matches,summary=f'Демо-режим: найдено явных текстовых совпадений {ok} из {len(matches)}. Это проверка приложения, а не AI-оценка кандидата.')
+
 def calc_score(profile, assessment):
     reqs={r.id:r for r in profile.requirements}; found={m.requirement_id:m for m in assessment.matches}
     total=sum(r.weight for r in profile.requirements) or 1
@@ -117,8 +155,8 @@ class ApiTestThread(QThread):
 class SettingsDialog(QDialog):
     def __init__(self,parent=None):
         super().__init__(parent); self.setWindowTitle('Настройки AI'); self.resize(520,240); f=QFormLayout(self)
-        self.provider=QComboBox(); self.provider.addItems(['DeepSeek','OpenAI'])
-        self.provider.setCurrentText(keyring.get_password(SERVICE,'provider') or 'DeepSeek')
+        self.provider=QComboBox(); self.provider.addItems(['Демо (без API)','DeepSeek','OpenAI'])
+        self.provider.setCurrentText(keyring.get_password(SERVICE,'provider') or 'Демо (без API)')
         self.key=QLineEdit(); self.key.setEchoMode(QLineEdit.Password)
         self.model=QComboBox(); self.model.setEditable(True)
         self.status=QLabel(''); self.status.setWordWrap(True)
@@ -130,6 +168,10 @@ class SettingsDialog(QDialog):
         self.provider_changed(self.provider.currentText(), initial=True)
     def provider_changed(self, provider, initial=False):
         self.model.clear()
+        if provider=='Демо (без API)':
+            self.model.addItem('Локальный demo matcher'); self.key.clear(); self.key.setEnabled(False); self.model.setEnabled(False); self.refresh_btn.setEnabled(False)
+            self.status.setText('Бесплатный локальный режим: API-ключ и интернет не нужны. Проверяет интерфейс, Drag & Drop, обработку файлов, таблицу и Excel.'); return
+        self.key.setEnabled(True); self.model.setEnabled(True); self.refresh_btn.setEnabled(True)
         if provider=='DeepSeek':
             self.model.addItems(['deepseek-v4-flash','deepseek-v4-pro'])
             key=keyring.get_password(SERVICE,'deepseek_api_key') or ''
@@ -159,6 +201,8 @@ class SettingsDialog(QDialog):
 
     def test_api(self):
         key=self.key.text().strip(); model=self.model.currentText().strip(); provider=self.provider.currentText()
+        if provider=='Демо (без API)':
+            self.status.setText('✓ Демо-режим готов. API не используется.'); self.status.setStyleSheet('font-weight:600;color:#188038;'); return
         if not key or not model: QMessageBox.warning(self,'Не хватает данных','Введите API-ключ и выберите модель.'); return
         self.test_btn.setEnabled(False); self.status.setText('Проверяю подключение…')
         self.tester=ApiTestThread(provider,key,model); self.tester.done.connect(self.test_done); self.tester.start()
@@ -168,8 +212,9 @@ class SettingsDialog(QDialog):
     def save(self):
         provider=self.provider.currentText(); key=self.key.text().strip(); model=self.model.currentText().strip()
         keyring.set_password(SERVICE,'provider',provider)
-        prefix='deepseek' if provider=='DeepSeek' else 'openai'
-        keyring.set_password(SERVICE,f'{prefix}_api_key',key); keyring.set_password(SERVICE,f'{prefix}_model',model)
+        if provider!='Демо (без API)':
+            prefix='deepseek' if provider=='DeepSeek' else 'openai'
+            keyring.set_password(SERVICE,f'{prefix}_api_key',key); keyring.set_password(SERVICE,f'{prefix}_model',model)
         self.accept()
 
 def llm_structured(client, provider, model, messages, schema_cls):
@@ -191,7 +236,14 @@ class AnalyzeThread(QThread):
     def run(self):
         try:
             from openai import OpenAI
-            provider=keyring.get_password(SERVICE,'provider') or 'DeepSeek'
+            provider=keyring.get_password(SERVICE,'provider') or 'Демо (без API)'
+            if provider=='Демо (без API)':
+                self.progress.emit(5,'Демо: извлекаю требования локально…'); profile=demo_profile(self.vacancy); results=[]
+                for i,path in enumerate(self.paths):
+                    self.progress.emit(10+int(85*i/max(1,len(self.paths))),f'Демо-анализ: {Path(path).name}'); text=extract_text(path)
+                    if not text.strip(): raise RuntimeError(f'Не удалось извлечь текст из {Path(path).name}. Возможно, это скан без текстового слоя.')
+                    results.append((path,demo_assessment(profile,text,path)))
+                self.progress.emit(100,'Демо-анализ готов'); self.done.emit(profile,results); return
             if provider=='DeepSeek':
                 key=keyring.get_password(SERVICE,'deepseek_api_key') or os.getenv('DEEPSEEK_API_KEY')
                 model=keyring.get_password(SERVICE,'deepseek_model') or 'deepseek-v4-flash'
@@ -228,7 +280,7 @@ class MainWindow(QMainWindow):
         self.tabs=QTabWidget(); lay.addWidget(self.tabs)
         inp=QWidget(); il=QVBoxLayout(inp); il.addWidget(QLabel('<b>Вакансия</b>'))
         self.vac=QPlainTextEdit(); self.vac.setPlaceholderText('Вставьте сюда описание вакансии…'); il.addWidget(self.vac)
-        vh=QHBoxLayout(); vf=QPushButton('Загрузить вакансию из файла'); vf.clicked.connect(self.load_vac); vh.addWidget(vf); vh.addStretch(); il.addLayout(vh)
+        vh=QHBoxLayout(); vf=QPushButton('Загрузить вакансию из файла'); vf.clicked.connect(self.load_vac); vh.addWidget(vf); demo=QPushButton('★ Загрузить демо-данные'); demo.clicked.connect(self.load_demo); vh.addWidget(demo); vh.addStretch(); il.addLayout(vh)
         il.addWidget(QLabel('<b>Резюме — перетащите файлы в область ниже (Drag & Drop)</b>'))
         self.drop=DropList(); il.addWidget(self.drop)
         bh=QHBoxLayout(); add=QPushButton('+ Добавить резюме'); add.clicked.connect(self.add_cv); rm=QPushButton('Удалить выбранные'); rm.clicked.connect(self.remove_cv); bh.addWidget(add); bh.addWidget(rm); bh.addStretch(); il.addLayout(bh)
@@ -237,6 +289,16 @@ class MainWindow(QMainWindow):
         self.tabs.addTab(inp,'Анализ')
         out=QWidget(); ol=QVBoxLayout(out); self.table=QTableWidget(0,6); self.table.setHorizontalHeaderLabels(['Кандидат','Score','Must have','Nice to have','Файл','Результат']); self.table.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch); self.table.doubleClicked.connect(self.show_detail); ol.addWidget(self.table)
         ex=QPushButton('Экспортировать в Excel'); ex.clicked.connect(self.export_excel); ol.addWidget(ex); self.tabs.addTab(out,'Результаты')
+    def load_demo(self):
+        self.vac.setPlainText("Senior Python Backend Developer\nТребования:\n- Python от 3 лет\n- FastAPI\n- PostgreSQL\n- Docker\n- REST API\n- Git\nБудет плюсом: Kubernetes, Kafka, AWS\nАнглийский B2+")
+        demo_dir=Path.home()/'.cv_matcher_demo'; demo_dir.mkdir(exist_ok=True)
+        samples={'Anna_Smirnova.txt':"Анна Смирнова\nBackend Developer, 5 лет опыта\nPython, FastAPI, PostgreSQL, Docker, REST API, Git.\nРаботала с Kubernetes и AWS. English B2.",'Ivan_Petrov.txt':"Иван Петров\nPython Developer, 3 года\nPython, Django, PostgreSQL, REST, Git, Docker.\nБазовый опыт Kafka.",'Sergey_Volkov.txt':"Сергей Волков\nSoftware Developer, 2 года\nJava, Spring Boot, MySQL, Git. English B1."}
+        paths=[]
+        for name,text in samples.items():
+            fp=demo_dir/name; fp.write_text(text,encoding='utf-8'); paths.append(str(fp))
+        self.drop.clear(); self.drop.add_paths(paths); keyring.set_password(SERVICE,'provider','Демо (без API)')
+        QMessageBox.information(self,'Демо готово','Загружены тестовая вакансия и 3 тестовых резюме.\n\nНажмите «ПРОАНАЛИЗИРОВАТЬ». API-ключ не нужен.')
+
     def load_vac(self):
         p,_=QFileDialog.getOpenFileName(self,'Вакансия','','Documents (*.pdf *.docx *.txt *.md)')
         if p:
