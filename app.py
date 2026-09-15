@@ -14,7 +14,7 @@ from openpyxl import Workbook
 from openpyxl.styles import Font, PatternFill, Alignment
 import keyring
 
-APP='CV Matcher'; SERVICE='cv-matcher-openai'
+APP='CV Matcher'; SERVICE='cv-matcher-ai'
 
 class Requirement(BaseModel):
     id: str
@@ -80,16 +80,59 @@ class DropList(QListWidget):
         self.pathsChanged.emit()
     def paths(self): return [self.item(i).data(Qt.UserRole) for i in range(self.count())]
 
+class ApiTestThread(QThread):
+    done=Signal(bool,str)
+    def __init__(self, provider, key, model):
+        super().__init__(); self.provider=provider; self.key=key; self.model=model
+    def run(self):
+        try:
+            from openai import OpenAI
+            base_url='https://api.deepseek.com' if self.provider=='DeepSeek' else None
+            client=OpenAI(api_key=self.key, base_url=base_url) if base_url else OpenAI(api_key=self.key)
+            r=client.responses.create(model=self.model,input='Ответь только словом OK.')
+            text=(getattr(r,'output_text','') or '').strip()
+            self.done.emit(True, f'Подключение успешно. Модель: {self.model}' + (f' · Ответ: {text[:40]}' if text else ''))
+        except Exception as e:
+            self.done.emit(False, str(e))
+
 class SettingsDialog(QDialog):
     def __init__(self,parent=None):
-        super().__init__(parent); self.setWindowTitle('Настройки'); f=QFormLayout(self)
-        self.key=QLineEdit(); self.key.setEchoMode(QLineEdit.Password); self.key.setText(keyring.get_password(SERVICE,'api_key') or '')
-        self.model=QComboBox(); self.model.addItems(['gpt-5.6-luna','gpt-5.6-terra','gpt-5.6-sol'])
-        self.model.setCurrentText(keyring.get_password(SERVICE,'model') or 'gpt-5.6-luna')
-        f.addRow('OpenAI API key:',self.key); f.addRow('Модель:',self.model)
-        b=QDialogButtonBox(QDialogButtonBox.Save|QDialogButtonBox.Cancel); b.accepted.connect(self.save); b.rejected.connect(self.reject); f.addRow(b)
+        super().__init__(parent); self.setWindowTitle('Настройки AI'); self.resize(520,240); f=QFormLayout(self)
+        self.provider=QComboBox(); self.provider.addItems(['DeepSeek','OpenAI'])
+        self.provider.setCurrentText(keyring.get_password(SERVICE,'provider') or 'DeepSeek')
+        self.key=QLineEdit(); self.key.setEchoMode(QLineEdit.Password)
+        self.model=QComboBox(); self.model.setEditable(True)
+        self.status=QLabel(''); self.status.setWordWrap(True)
+        self.test_btn=QPushButton('Проверить подключение'); self.test_btn.clicked.connect(self.test_api)
+        self.provider.currentTextChanged.connect(self.provider_changed)
+        f.addRow('AI-провайдер:',self.provider); f.addRow('API-ключ:',self.key); f.addRow('Модель:',self.model); f.addRow('',self.test_btn); f.addRow('',self.status)
+        b=QDialogButtonBox(QDialogButtonBox.Save|QDialogButtonBox.Cancel); b.button(QDialogButtonBox.Save).setText('Сохранить'); b.button(QDialogButtonBox.Cancel).setText('Отмена'); b.accepted.connect(self.save); b.rejected.connect(self.reject); f.addRow(b)
+        self.provider_changed(self.provider.currentText(), initial=True)
+    def provider_changed(self, provider, initial=False):
+        self.model.clear()
+        if provider=='DeepSeek':
+            self.model.addItems(['deepseek-flash','deepseek-v4-pro'])
+            key=keyring.get_password(SERVICE,'deepseek_api_key') or ''
+            saved=keyring.get_password(SERVICE,'deepseek_model') or 'deepseek-flash'
+        else:
+            self.model.addItems(['gpt-5.6-luna','gpt-5.6-terra','gpt-5.6-sol'])
+            key=keyring.get_password(SERVICE,'openai_api_key') or keyring.get_password('cv-matcher-openai','api_key') or ''
+            saved=keyring.get_password(SERVICE,'openai_model') or keyring.get_password('cv-matcher-openai','model') or 'gpt-5.6-luna'
+        self.key.setText(key); self.model.setCurrentText(saved); self.status.setText('')
+    def test_api(self):
+        key=self.key.text().strip(); model=self.model.currentText().strip(); provider=self.provider.currentText()
+        if not key or not model: QMessageBox.warning(self,'Не хватает данных','Введите API-ключ и выберите модель.'); return
+        self.test_btn.setEnabled(False); self.status.setText('Проверяю подключение…')
+        self.tester=ApiTestThread(provider,key,model); self.tester.done.connect(self.test_done); self.tester.start()
+    def test_done(self, ok, msg):
+        self.test_btn.setEnabled(True); self.status.setText(('✓ ' if ok else '✗ ')+msg)
+        self.status.setStyleSheet('font-weight:600;' + ('color:#188038;' if ok else 'color:#b3261e;'))
     def save(self):
-        keyring.set_password(SERVICE,'api_key',self.key.text().strip()); keyring.set_password(SERVICE,'model',self.model.currentText()); self.accept()
+        provider=self.provider.currentText(); key=self.key.text().strip(); model=self.model.currentText().strip()
+        keyring.set_password(SERVICE,'provider',provider)
+        prefix='deepseek' if provider=='DeepSeek' else 'openai'
+        keyring.set_password(SERVICE,f'{prefix}_api_key',key); keyring.set_password(SERVICE,f'{prefix}_model',model)
+        self.accept()
 
 class AnalyzeThread(QThread):
     progress=Signal(int,str); done=Signal(object,object); failed=Signal(str)
@@ -97,9 +140,17 @@ class AnalyzeThread(QThread):
     def run(self):
         try:
             from openai import OpenAI
-            key=keyring.get_password(SERVICE,'api_key') or os.getenv('OPENAI_API_KEY')
-            if not key: raise RuntimeError('Добавьте OpenAI API key в Настройки.')
-            model=keyring.get_password(SERVICE,'model') or 'gpt-5.6-luna'; client=OpenAI(api_key=key)
+            provider=keyring.get_password(SERVICE,'provider') or 'DeepSeek'
+            if provider=='DeepSeek':
+                key=keyring.get_password(SERVICE,'deepseek_api_key') or os.getenv('DEEPSEEK_API_KEY')
+                model=keyring.get_password(SERVICE,'deepseek_model') or 'deepseek-flash'
+                if not key: raise RuntimeError('Добавьте DeepSeek API-ключ в Настройки.')
+                client=OpenAI(api_key=key, base_url='https://api.deepseek.com')
+            else:
+                key=keyring.get_password(SERVICE,'openai_api_key') or keyring.get_password('cv-matcher-openai','api_key') or os.getenv('OPENAI_API_KEY')
+                model=keyring.get_password(SERVICE,'openai_model') or keyring.get_password('cv-matcher-openai','model') or 'gpt-5.6-luna'
+                if not key: raise RuntimeError('Добавьте OpenAI API-ключ в Настройки.')
+                client=OpenAI(api_key=key)
             self.progress.emit(3,'Извлекаю требования вакансии…')
             resp=client.responses.parse(model=model,input=[
               {'role':'system','content':('Извлеки только профессиональные требования вакансии. Не используй имя, возраст, пол, фото, национальность, семейное положение и другие нерелевантные персональные признаки. '
