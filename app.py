@@ -14,7 +14,7 @@ from openpyxl import Workbook
 from openpyxl.styles import Font, PatternFill, Alignment
 import keyring
 
-APP='CV Matcher'; SERVICE='cv-matcher-ai'
+APP='CV Matcher'; VERSION='0.3'; SERVICE='cv-matcher-ai'
 
 class Requirement(BaseModel):
     id: str
@@ -39,6 +39,21 @@ class CandidateAssessment(BaseModel):
 
 STATUS_FACTOR={'MATCH':1.0,'PARTIAL_MATCH':0.5,'NO_MATCH':0.0,'NOT_FOUND':0.0}
 STATUS_ICON={'MATCH':'✓','PARTIAL_MATCH':'~','NO_MATCH':'✗','NOT_FOUND':'?'}
+
+def friendly_api_error(exc):
+    text=str(exc)
+    low=text.lower()
+    if '401' in text or 'authentication' in low or 'invalid api key' in low:
+        return 'API-ключ не принят. Проверьте, что ключ скопирован полностью и относится к выбранному провайдеру.'
+    if '402' in text or 'insufficient' in low or 'balance' in low or 'quota' in low:
+        return 'Недостаточно API-баланса/квоты у провайдера.'
+    if '429' in text or 'rate limit' in low:
+        return 'Слишком много запросов. Подождите немного и повторите.'
+    if 'timeout' in low or 'connection' in low:
+        return 'Не удалось подключиться к API. Проверьте интернет, VPN/прокси и повторите.'
+    if 'model' in low and ('not found' in low or 'does not exist' in low or 'invalid' in low):
+        return 'Эта модель недоступна для данного API-ключа. Нажмите «Обновить список моделей».'
+    return text[:700]
 
 
 def extract_text(path: str) -> str:
@@ -89,11 +104,15 @@ class ApiTestThread(QThread):
             from openai import OpenAI
             base_url='https://api.deepseek.com' if self.provider=='DeepSeek' else None
             client=OpenAI(api_key=self.key, base_url=base_url) if base_url else OpenAI(api_key=self.key)
-            r=client.responses.create(model=self.model,input='Ответь только словом OK.')
-            text=(getattr(r,'output_text','') or '').strip()
+            if self.provider=='DeepSeek':
+                r=client.chat.completions.create(model=self.model,messages=[{'role':'user','content':'Ответь только словом OK.'}],max_tokens=16,extra_body={'thinking':{'type':'disabled'}})
+                text=(r.choices[0].message.content or '').strip()
+            else:
+                r=client.responses.create(model=self.model,input='Ответь только словом OK.',max_output_tokens=32)
+                text=(getattr(r,'output_text','') or '').strip()
             self.done.emit(True, f'Подключение успешно. Модель: {self.model}' + (f' · Ответ: {text[:40]}' if text else ''))
         except Exception as e:
-            self.done.emit(False, str(e))
+            self.done.emit(False, friendly_api_error(e))
 
 class SettingsDialog(QDialog):
     def __init__(self,parent=None):
@@ -104,21 +123,40 @@ class SettingsDialog(QDialog):
         self.model=QComboBox(); self.model.setEditable(True)
         self.status=QLabel(''); self.status.setWordWrap(True)
         self.test_btn=QPushButton('Проверить подключение'); self.test_btn.clicked.connect(self.test_api)
+        self.refresh_btn=QPushButton('Обновить список моделей'); self.refresh_btn.clicked.connect(self.refresh_models)
         self.provider.currentTextChanged.connect(self.provider_changed)
-        f.addRow('AI-провайдер:',self.provider); f.addRow('API-ключ:',self.key); f.addRow('Модель:',self.model); f.addRow('',self.test_btn); f.addRow('',self.status)
+        f.addRow('AI-провайдер:',self.provider); f.addRow('API-ключ:',self.key); f.addRow('Модель:',self.model); f.addRow('',self.refresh_btn); f.addRow('',self.test_btn); f.addRow('',self.status)
         b=QDialogButtonBox(QDialogButtonBox.Save|QDialogButtonBox.Cancel); b.button(QDialogButtonBox.Save).setText('Сохранить'); b.button(QDialogButtonBox.Cancel).setText('Отмена'); b.accepted.connect(self.save); b.rejected.connect(self.reject); f.addRow(b)
         self.provider_changed(self.provider.currentText(), initial=True)
     def provider_changed(self, provider, initial=False):
         self.model.clear()
         if provider=='DeepSeek':
-            self.model.addItems(['deepseek-flash','deepseek-v4-pro'])
+            self.model.addItems(['deepseek-v4-flash','deepseek-v4-pro'])
             key=keyring.get_password(SERVICE,'deepseek_api_key') or ''
-            saved=keyring.get_password(SERVICE,'deepseek_model') or 'deepseek-flash'
+            saved=keyring.get_password(SERVICE,'deepseek_model') or 'deepseek-v4-flash'
         else:
             self.model.addItems(['gpt-5.6-luna','gpt-5.6-terra','gpt-5.6-sol'])
             key=keyring.get_password(SERVICE,'openai_api_key') or keyring.get_password('cv-matcher-openai','api_key') or ''
             saved=keyring.get_password(SERVICE,'openai_model') or keyring.get_password('cv-matcher-openai','model') or 'gpt-5.6-luna'
         self.key.setText(key); self.model.setCurrentText(saved); self.status.setText('')
+    def refresh_models(self):
+        key=self.key.text().strip(); provider=self.provider.currentText()
+        if not key:
+            QMessageBox.warning(self,'Не хватает данных','Сначала введите API-ключ.'); return
+        try:
+            from openai import OpenAI
+            client=OpenAI(api_key=key, base_url='https://api.deepseek.com') if provider=='DeepSeek' else OpenAI(api_key=key)
+            models=sorted({m.id for m in client.models.list().data})
+            if provider=='DeepSeek':
+                models=[m for m in models if 'deepseek' in m.lower()] or models
+            current=self.model.currentText(); self.model.clear(); self.model.addItems(models)
+            if current in models: self.model.setCurrentText(current)
+            self.status.setText(f'✓ Получено моделей: {len(models)}')
+            self.status.setStyleSheet('font-weight:600;color:#188038;')
+        except Exception as e:
+            self.status.setText('✗ Не удалось получить список моделей: '+friendly_api_error(e))
+            self.status.setStyleSheet('font-weight:600;color:#b3261e;')
+
     def test_api(self):
         key=self.key.text().strip(); model=self.model.currentText().strip(); provider=self.provider.currentText()
         if not key or not model: QMessageBox.warning(self,'Не хватает данных','Введите API-ключ и выберите модель.'); return
@@ -134,6 +172,19 @@ class SettingsDialog(QDialog):
         keyring.set_password(SERVICE,f'{prefix}_api_key',key); keyring.set_password(SERVICE,f'{prefix}_model',model)
         self.accept()
 
+def llm_structured(client, provider, model, messages, schema_cls):
+    if provider=='DeepSeek':
+        # DeepSeek's OpenAI-compatible Chat Completions supports JSON output.
+        schema=json.dumps(schema_cls.model_json_schema(),ensure_ascii=False)
+        msgs=list(messages)
+        msgs.insert(0, {'role':'system','content':'Верни только валидный JSON без markdown. JSON должен соответствовать этой JSON Schema: '+schema})
+        r=client.chat.completions.create(model=model,messages=msgs,response_format={'type':'json_object'},max_tokens=12000,extra_body={'thinking':{'type':'disabled'}})
+        content=r.choices[0].message.content or ''
+        if not content.strip(): raise RuntimeError('DeepSeek вернул пустой JSON. Повторите запрос.')
+        return schema_cls.model_validate_json(content)
+    r=client.responses.parse(model=model,input=messages,text_format=schema_cls)
+    return r.output_parsed
+
 class AnalyzeThread(QThread):
     progress=Signal(int,str); done=Signal(object,object); failed=Signal(str)
     def __init__(self,vacancy,paths): super().__init__(); self.vacancy=vacancy; self.paths=paths
@@ -143,7 +194,7 @@ class AnalyzeThread(QThread):
             provider=keyring.get_password(SERVICE,'provider') or 'DeepSeek'
             if provider=='DeepSeek':
                 key=keyring.get_password(SERVICE,'deepseek_api_key') or os.getenv('DEEPSEEK_API_KEY')
-                model=keyring.get_password(SERVICE,'deepseek_model') or 'deepseek-flash'
+                model=keyring.get_password(SERVICE,'deepseek_model') or 'deepseek-v4-flash'
                 if not key: raise RuntimeError('Добавьте DeepSeek API-ключ в Настройки.')
                 client=OpenAI(api_key=key, base_url='https://api.deepseek.com')
             else:
@@ -152,11 +203,10 @@ class AnalyzeThread(QThread):
                 if not key: raise RuntimeError('Добавьте OpenAI API-ключ в Настройки.')
                 client=OpenAI(api_key=key)
             self.progress.emit(3,'Извлекаю требования вакансии…')
-            resp=client.responses.parse(model=model,input=[
+            profile=llm_structured(client,provider,model,[
               {'role':'system','content':('Извлеки только профессиональные требования вакансии. Не используй имя, возраст, пол, фото, национальность, семейное положение и другие нерелевантные персональные признаки. '
                  'Каждому требованию дай короткий уникальный id, priority must_have/nice_to_have и вес 1-100 по важности. Не выдумывай требования.')},
-              {'role':'user','content':self.vacancy}], text_format=VacancyProfile)
-            profile=resp.output_parsed
+              {'role':'user','content':self.vacancy}],VacancyProfile)
             results=[]
             for i,path in enumerate(self.paths):
                 self.progress.emit(8+int(85*i/max(1,len(self.paths))),f'Анализ: {Path(path).name}')
@@ -164,16 +214,16 @@ class AnalyzeThread(QThread):
                 if not text.strip(): raise RuntimeError(f'Не удалось извлечь текст из {Path(path).name}. Возможно, это скан без текстового слоя.')
                 req_json=json.dumps(profile.model_dump(),ensure_ascii=False)
                 prompt=f'''Сравни резюме с требованиями. Для КАЖДОГО requirement_id верни ровно один match.\nСтатусы: MATCH = явно подтверждено; PARTIAL_MATCH = подтверждено частично; NO_MATCH = в CV есть данные, явно противоречащие требованию; NOT_FOUND = данных недостаточно.\nEvidence — короткая цитата/факт только из CV, без выдумок. Не делай выводов по защищенным/нерелевантным персональным признакам. Оценивай только профессиональные данные.\nТРЕБОВАНИЯ:\n{req_json}\n\nРЕЗЮМЕ ({Path(path).name}):\n{text[:90000]}'''
-                rr=client.responses.parse(model=model,input=[{'role':'system','content':'Ты аккуратный инструмент сопоставления CV с требованиями. Не принимай решение о найме; только документируй соответствие требованиям.'},{'role':'user','content':prompt}],text_format=CandidateAssessment)
-                results.append((path,rr.output_parsed))
+                assessment=llm_structured(client,provider,model,[{'role':'system','content':'Ты аккуратный инструмент сопоставления CV с требованиями. Не принимай решение о найме; только документируй соответствие требованиям.'},{'role':'user','content':prompt}],CandidateAssessment)
+                results.append((path,assessment))
             self.progress.emit(100,'Готово'); self.done.emit(profile,results)
-        except Exception as e: self.failed.emit(f'{e}\n\n{traceback.format_exc()}')
+        except Exception as e: self.failed.emit(f'{friendly_api_error(e)}\n\nТехнические детали:\n{traceback.format_exc()}')
 
 class MainWindow(QMainWindow):
     def __init__(self):
-        super().__init__(); self.setWindowTitle('CV Matcher'); self.resize(1150,760); self.profile=None; self.results=[]
+        super().__init__(); self.setWindowTitle(f'CV Matcher {VERSION}'); self.resize(1150,760); self.profile=None; self.results=[]
         root=QWidget(); self.setCentralWidget(root); lay=QVBoxLayout(root)
-        top=QHBoxLayout(); title=QLabel('CV MATCHER'); title.setStyleSheet('font-size:24px;font-weight:700'); top.addWidget(title); top.addStretch()
+        top=QHBoxLayout(); title=QLabel(f'CV MATCHER  <span style="font-size:13px;color:#6b7280">v{VERSION}</span>'); title.setStyleSheet('font-size:24px;font-weight:700'); top.addWidget(title); top.addStretch()
         settings=QPushButton('⚙ Настройки'); settings.clicked.connect(lambda: SettingsDialog(self).exec()); top.addWidget(settings); lay.addLayout(top)
         self.tabs=QTabWidget(); lay.addWidget(self.tabs)
         inp=QWidget(); il=QVBoxLayout(inp); il.addWidget(QLabel('<b>Вакансия</b>'))
@@ -240,5 +290,5 @@ class MainWindow(QMainWindow):
         wb.save(p); QMessageBox.information(self,'Готово',f'Excel сохранён:\n{p}')
 
 def main():
-    app=QApplication(sys.argv); app.setStyle('Fusion'); w=MainWindow(); w.show(); sys.exit(app.exec())
+    app=QApplication(sys.argv); app.setStyle('Fusion'); app.setStyleSheet('QPushButton{padding:6px 10px;} QLineEdit,QComboBox{padding:5px;} QTabWidget::pane{border:1px solid #d1d5db;}'); w=MainWindow(); w.show(); sys.exit(app.exec())
 if __name__=='__main__': main()
